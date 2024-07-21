@@ -1,9 +1,7 @@
 
-import Docker from 'dockerode';
 import { Pool } from 'pg';
+import { newDb } from 'pg-mem';
 import { v4 as uuidv4 } from 'uuid';
-
-const docker = new Docker();
 
 interface ColumnInfo {
     type: string;
@@ -37,148 +35,83 @@ interface SchemaDiff {
         [tableName: string]: {
             columnsAdded: string[];
             columnsRemoved: string[];
-            columnsDiff: {
-                [columnName: string]: {
-                    from: ColumnInfo;
-                    to: ColumnInfo;
-                };
-            };
+            columnsDiff: { [columnName: string]: { from: ColumnInfo; to: ColumnInfo } };
             foreignKeysAdded: ForeignKeyInfo[];
             foreignKeysRemoved: ForeignKeyInfo[];
         };
     };
 }
 
-interface PreviewContainer {
+interface PreviewDatabase {
     id: string;
-    connectionString: string;
+    db: any; // pg-mem database instance
     lastAccessed: number;
 }
 
-const activeContainers: { [userId: string]: PreviewContainer } = {};
+const activeDatabases: { [userId: string]: PreviewDatabase } = {};
 
-async function startPreviewContainer(userId: string): Promise<string> {
-    const containerId = `preview-${userId}-${uuidv4()}`;
-    const containerPort = 5433 + Object.keys(activeContainers).length; // Assuming we start from 5433
+async function createPreviewDatabase(userId: string): Promise<any> {
+    const dbId = `preview-${userId}-${uuidv4()}`;
+    const db = newDb();
 
-    await docker.pull('postgres:13');
-
-    const container = await docker.createContainer({
-        Image: 'postgres:13',
-        name: containerId,
-        Env: [
-            'POSTGRES_DB=preview_db',
-            'POSTGRES_USER=preview_user',
-            'POSTGRES_PASSWORD=preview_password'
-        ],
-        HostConfig: {
-            PortBindings: { '5432/tcp': [{ HostPort: containerPort.toString() }] }
-        }
-    });
-
-    await container.start();
-
-    // Wait for Postgres to be ready
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    const connectionString = `postgresql://preview_user:preview_password@localhost:${containerPort}/preview_db`;
-
-    activeContainers[userId] = {
-        id: containerId,
-        connectionString,
+    activeDatabases[userId] = {
+        id: dbId,
+        db: db,
         lastAccessed: Date.now()
     };
 
-    return connectionString;
+    return db;
 }
 
-async function stopPreviewContainer(userId: string) {
-    const containerInfo = activeContainers[userId];
-    if (containerInfo) {
-        const container = docker.getContainer(containerInfo.id);
-        await container.stop();
-        await container.remove();
-        delete activeContainers[userId];
-    }
+async function removePreviewDatabase(userId: string) {
+    delete activeDatabases[userId];
 }
 
-async function cleanupInactiveContainers() {
+async function cleanupInactiveDatabases() {
     const now = Date.now();
     const inactiveThreshold = 30 * 60 * 1000; // 30 minutes
 
-    for (const [userId, containerInfo] of Object.entries(activeContainers)) {
-        if (now - containerInfo.lastAccessed > inactiveThreshold) {
-            await stopPreviewContainer(userId);
+    for (const [userId, dbInfo] of Object.entries(activeDatabases)) {
+        if (now - dbInfo.lastAccessed > inactiveThreshold) {
+            await removePreviewDatabase(userId);
         }
     }
 }
 
-async function getSchema(connectionString: string): Promise<DatabaseSchema> {
-    const pool = new Pool({ connectionString });
-    try {
-        const tablesResult = await pool.query(`
-      SELECT table_name
-      FROM information_schema.tables
-      WHERE table_schema = 'public'
-    `);
+async function getSchema(db: any): Promise<DatabaseSchema> {
+    const schema: DatabaseSchema = {};
 
-        const schema: DatabaseSchema = {};
+    const tables = db.public.tables;
+    for (const table of tables) {
+        const tableName = table.name;
+        schema[tableName] = {
+            columns: {},
+            foreignKeys: []
+        };
 
-        for (const { table_name } of tablesResult.rows) {
-            const columnsResult = await pool.query(`
-        SELECT column_name, data_type, character_maximum_length, is_nullable, column_default,
-               (SELECT true FROM information_schema.key_column_usage
-                WHERE table_name = c.table_name AND column_name = c.column_name
-                  AND constraint_name = (SELECT constraint_name FROM information_schema.table_constraints
-                                         WHERE table_name = c.table_name AND constraint_type = 'PRIMARY KEY'
-                                         LIMIT 1)) as is_primary_key
-        FROM information_schema.columns c
-        WHERE table_name = $1
-      `, [table_name]);
-
-            const foreignKeysResult = await pool.query(`
-        SELECT
-          kcu.column_name,
-          ccu.table_name AS foreign_table_name,
-          ccu.column_name AS foreign_column_name,
-          rc.update_rule,
-          rc.delete_rule
-        FROM information_schema.key_column_usage AS kcu
-        JOIN information_schema.constraint_column_usage AS ccu
-          ON ccu.constraint_name = kcu.constraint_name
-        JOIN information_schema.referential_constraints AS rc
-          ON rc.constraint_name = kcu.constraint_name
-        WHERE kcu.table_name = $1
-      `, [table_name]);
-
-            schema[table_name] = {
-                columns: {},
-                foreignKeys: foreignKeysResult.rows.map(row => ({
-                    columnName: row.column_name,
-                    referenceTable: row.foreign_table_name,
-                    referenceColumn: row.foreign_column_name,
-                    updateRule: row.update_rule,
-                    deleteRule: row.delete_rule
-                }))
+        for (const column of table.columns) {
+            schema[tableName].columns[column.name] = {
+                type: column.type,
+                maxLength: null, // pg-mem doesn't provide this information
+                isNullable: !column.notnull,
+                defaultValue: column.default_value,
+                isPrimaryKey: column.isPrimaryKey
             };
-
-            for (const column of columnsResult.rows) {
-                schema[table_name].columns[column.column_name] = {
-                    type: column.data_type,
-                    maxLength: column.character_maximum_length,
-                    isNullable: column.is_nullable === 'YES',
-                    defaultValue: column.column_default,
-                    isPrimaryKey: column.is_primary_key || false
-                };
-            }
         }
 
-        return schema;
-    } finally {
-        await pool.end();
+        for (const fk of table.foreignKeys) {
+            schema[tableName].foreignKeys.push({
+                columnName: fk.columns[0],
+                referenceTable: fk.referencedTable,
+                referenceColumn: fk.referencedColumns[0],
+                updateRule: 'NO ACTION', // pg-mem doesn't provide this information
+                deleteRule: 'NO ACTION' // pg-mem doesn't provide this information
+            });
+        }
     }
-}
 
+    return schema;
+}
 function compareSchemas(schema1: DatabaseSchema, schema2: DatabaseSchema): SchemaDiff {
     const diff: SchemaDiff = {
         tablesAdded: [],
@@ -193,7 +126,18 @@ function compareSchemas(schema1: DatabaseSchema, schema2: DatabaseSchema): Schem
     // Compare tables that exist in both schemas
     for (const table of Object.keys(schema1)) {
         if (table in schema2) {
-            const tableDiff: SchemaDiff['tablesDiff'][string] = {
+            const tableDiff: {
+                columnsAdded: string[];
+                columnsRemoved: string[];
+                columnsDiff: {
+                    [columnName: string]: {
+                        from: ColumnInfo;
+                        to: ColumnInfo;
+                    };
+                };
+                foreignKeysAdded: ForeignKeyInfo[];
+                foreignKeysRemoved: ForeignKeyInfo[];
+            } = {
                 columnsAdded: [],
                 columnsRemoved: [],
                 columnsDiff: {},
@@ -232,7 +176,7 @@ function compareSchemas(schema1: DatabaseSchema, schema2: DatabaseSchema): Schem
                 tableDiff.foreignKeysAdded.length > 0 ||
                 tableDiff.foreignKeysRemoved.length > 0
             ) {
-                diff.tablesDiff[table] = tableDiff;
+                diff.tablesDiff[table] = tableDiff as SchemaDiff['tablesDiff'][string];
             }
         }
     }
@@ -304,58 +248,59 @@ function generatePsql(diff: SchemaDiff): string {
 
     return psql;
 }
-
-async function applyPsqlToPreviewDB(connectionString: string, psql: string): Promise<void> {
-    const pool = new Pool({ connectionString });
-    try {
-        await pool.query(psql);
-    } finally {
-        await pool.end();
-    }
+async function applyPsqlToPreviewDB(db: any, psql: string): Promise<void> {
+    db.public.query(psql);
 }
 
 export async function previewChanges(userId: string, sourceConnectionString: string, targetConnectionString: string): Promise<{ psql: string; diff: SchemaDiff }> {
-    let previewConnectionString: string;
+    let previewDb: any;
 
-    if (activeContainers[userId]) {
-        previewConnectionString = activeContainers[userId].connectionString;
-        activeContainers[userId].lastAccessed = Date.now();
+    if (activeDatabases[userId]) {
+        previewDb = activeDatabases[userId].db;
+        activeDatabases[userId].lastAccessed = Date.now();
     } else {
-        previewConnectionString = await startPreviewContainer(userId);
+        previewDb = await createPreviewDatabase(userId);
     }
 
     try {
         // Copy the source schema to the preview database
-        const sourceSchema = await getSchema(sourceConnectionString);
+        const sourcePool = new Pool({ connectionString: sourceConnectionString });
+        const sourceSchema = await getSchema(sourcePool);
+        await sourcePool.end();
+
         const createSchemaSQL = generatePsql({
             tablesAdded: Object.keys(sourceSchema),
             tablesRemoved: [],
             tablesDiff: {}
         });
-        await applyPsqlToPreviewDB(previewConnectionString, createSchemaSQL);
+        await applyPsqlToPreviewDB(previewDb, createSchemaSQL);
 
         // Generate PSQL for changes
-        const targetSchema = await getSchema(targetConnectionString);
+        const targetPool = new Pool({ connectionString: targetConnectionString });
+        const targetSchema = await getSchema(targetPool);
+        await targetPool.end();
+
         const diff = compareSchemas(sourceSchema, targetSchema);
         const psql = generatePsql(diff);
 
         // Apply PSQL to preview database
-        await applyPsqlToPreviewDB(previewConnectionString, psql);
+        await applyPsqlToPreviewDB(previewDb, psql);
 
         // Compare preview database with target
-        const previewSchema = await getSchema(previewConnectionString);
+        const previewSchema = await getSchema(previewDb);
         const finalDiff = compareSchemas(previewSchema, targetSchema);
 
         return { psql, diff: finalDiff };
-    } catch (error) {
-        // If there's an error, stop the container to free up resources
-        await stopPreviewContainer(userId);
+    } catch (error: any) {
+        console.log('Error previewing changes:', error.message);
+        // If there's an error, remove the database to free up resources
+        await removePreviewDatabase(userId);
         throw error;
     }
 }
 
 // Run cleanup every 5 minutes
-setInterval(cleanupInactiveContainers, 5 * 60 * 1000);
+setInterval(cleanupInactiveDatabases, 5 * 60 * 1000);
 
 export type { DatabaseSchema, SchemaDiff };
 

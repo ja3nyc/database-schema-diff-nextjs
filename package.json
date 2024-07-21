@@ -14,5 +14,8 @@
     },
     "devDependencies": {
         "turbo": "^1.13.4"
+    },
+    "dependencies": {
+        "pg-mem": "^2.8.1"
     }
 }
