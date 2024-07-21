@@ -1,0 +1,5 @@
+FROM postgres:13
+
+ENV POSTGRES_DB=preview_db
+ENV POSTGRES_USER=preview_user
+ENV POSTGRES_PASSWORD=preview_password
