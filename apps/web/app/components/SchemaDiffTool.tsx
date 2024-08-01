@@ -99,7 +99,11 @@ export default function SchemaDiffTool({ userId }: SchemaDiffToolProps) {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ connectionString1, connectionString2 }),
+        body: JSON.stringify({
+          connectionString1,
+          connectionString2,
+          psql: psqlCommands,
+        }),
       });
 
       if (!response.ok) {
@@ -107,7 +111,6 @@ export default function SchemaDiffTool({ userId }: SchemaDiffToolProps) {
       }
 
       const result = await response.json();
-      setPreviewPsql(result.psql);
       setPreviewDiff(result.diff);
     } catch (error) {
       console.error("Error previewing changes:", error);
@@ -128,11 +131,11 @@ export default function SchemaDiffTool({ userId }: SchemaDiffToolProps) {
           <DialogHeader>
             <DialogTitle>Change Preview</DialogTitle>
           </DialogHeader>
-          <div className="space-y-4">
+          <div className="space-y-4 overflow-hidden">
             <div>
               <h3 className="text-lg font-semibold">PSQL to be executed:</h3>
-              <pre className="bg-slate-100 p-4 rounded mt-2 overflow-auto max-h-[30vh]">
-                {previewPsql}
+              <pre className="bg-slate-100 p-4 rounded mt-2 overflow-x-auto max-h-[30vh]">
+                {psqlCommands}
               </pre>
             </div>
             <div>

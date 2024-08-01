@@ -11,10 +11,18 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const { connectionString1, connectionString2 } = await request.json()
+    const { connectionString1, connectionString2, psql } = await request.json()
 
     try {
-        const preview = await previewChanges(user.id, connectionString1, connectionString2)
+        const preview = await previewChanges(user.id, connectionString1, connectionString2, psql)
+        
+        if (preview.verificationResult && !preview.verificationResult.isValid) {
+            return NextResponse.json({
+                error: 'Invalid PSQL',
+                details: preview.verificationResult.errors
+            }, { status: 400 })
+        }
+        
         return NextResponse.json(preview)
     } catch (error) {
         console.error('Error previewing changes:', error)
